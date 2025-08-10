@@ -1,0 +1,434 @@
+import React, { useRef, useEffect, useState } from "react";
+
+// Fluid Simulation (Particle-based) - Single-file React component
+// - 2D particle-based fluid approximation (smoothed-particle-like)
+// - Mouse/touch splats to add velocity and particles
+// - Simple spatial hash for neighbor queries
+// - Tailwind classes used for layout
+
+export default function FluidSim() {
+  const canvasRef = useRef(null);
+  const rafRef = useRef(null);
+  const [running, setRunning] = useState(true);
+  const [particleCount, setParticleCount] = useState(2000);
+  const [viscosity, setViscosity] = useState(0.02);
+  const [stiffness, setStiffness] = useState(0.5);
+  const [splatStrength, setSplatStrength] = useState(1.5);
+
+  // Simulation parameters
+  const paramsRef = useRef({
+    w: 800,
+    h: 600,
+    particleRadius: 2.0,
+    restDensity: 10,
+    smoothingRadius: 16,
+    dt: 1 / 60,
+  });
+
+  // State stored outside React to avoid re-renders
+  const simRef = useRef({ particles: [], grid: null, cols: 0, rows: 0 });
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext("2d");
+
+    // Set canvas size to match container
+    function resize() {
+      const parent = canvas.parentElement || document.body;
+      const rect = parent.getBoundingClientRect();
+      canvas.width = Math.max(300, Math.floor(rect.width - 32));
+      canvas.height = Math.max(200, Math.floor(rect.height - 120));
+      paramsRef.current.w = canvas.width;
+      paramsRef.current.h = canvas.height;
+      initGrid();
+    }
+
+    window.addEventListener("resize", resize);
+    resize();
+
+    initParticles(particleCount);
+
+    let last = performance.now();
+
+    function loop(now) {
+      const dt = Math.min(0.033, (now - last) / 1000);
+      last = now;
+      if (running) step(dt);
+      render(ctx);
+      rafRef.current = requestAnimationFrame(loop);
+    }
+
+    rafRef.current = requestAnimationFrame(loop);
+
+    // mouse interactions
+    let isDown = false;
+    let lastPos = null;
+
+    function getPos(e) {
+      const r = canvas.getBoundingClientRect();
+      if (e.touches && e.touches[0]) {
+        return { x: e.touches[0].clientX - r.left, y: e.touches[0].clientY - r.top };
+      }
+      return { x: e.clientX - r.left, y: e.clientY - r.top };
+    }
+
+    function onDown(e) {
+      isDown = true;
+      lastPos = getPos(e);
+      splatAt(lastPos.x, lastPos.y, 0, 0, 20);
+    }
+    function onMove(e) {
+      if (!isDown) return;
+      const p = getPos(e);
+      const vx = (p.x - lastPos.x) * 5;
+      const vy = (p.y - lastPos.y) * 5;
+      splatAt(p.x, p.y, vx * splatStrength, vy * splatStrength, 40);
+      lastPos = p;
+    }
+    function onUp() {
+      isDown = false;
+      lastPos = null;
+    }
+
+    canvas.addEventListener("pointerdown", onDown);
+    canvas.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    canvas.addEventListener("touchstart", onDown, { passive: true });
+    canvas.addEventListener("touchmove", onMove, { passive: true });
+    window.addEventListener("touchend", onUp);
+
+    return () => {
+      cancelAnimationFrame(rafRef.current);
+      window.removeEventListener("resize", resize);
+      canvas.removeEventListener("pointerdown", onDown);
+      canvas.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      canvas.removeEventListener("touchstart", onDown);
+      window.removeEventListener("touchmove", onMove);
+      window.removeEventListener("touchend", onUp);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // When particleCount changes, re-init particles
+  useEffect(() => {
+    initParticles(particleCount);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [particleCount]);
+
+  // Utility: spatial hash grid
+  function initGrid() {
+    const r = paramsRef.current.smoothingRadius;
+    const w = paramsRef.current.w;
+    const h = paramsRef.current.h;
+    const cols = Math.ceil(w / r);
+    const rows = Math.ceil(h / r);
+    simRef.current.grid = new Array(cols * rows).fill(null).map(() => []);
+    simRef.current.cols = cols;
+    simRef.current.rows = rows;
+  }
+
+  function clearGrid() {
+    const grid = simRef.current.grid;
+    for (let i = 0; i < grid.length; i++) grid[i].length = 0;
+  }
+
+  function gridIndex(x, y) {
+    const c = Math.floor(x / paramsRef.current.smoothingRadius);
+    const r = Math.floor(y / paramsRef.current.smoothingRadius);
+    if (c < 0 || r < 0 || c >= simRef.current.cols || r >= simRef.current.rows) return -1;
+    return r * simRef.current.cols + c;
+  }
+
+  // Particle initialization
+  function initParticles(count) {
+    const particles = [];
+    const w = paramsRef.current.w;
+    const h = paramsRef.current.h;
+    for (let i = 0; i < count; i++) {
+      const x = Math.random() * w * 0.9 + w * 0.05;
+      const y = Math.random() * h * 0.9 + h * 0.05;
+      particles.push({
+        x,
+        y,
+        vx: 0,
+        vy: 0,
+        ax: 0,
+        ay: 0,
+        density: 0,
+        pressure: 0,
+      });
+    }
+    simRef.current.particles = particles;
+    initGrid();
+  }
+
+  // Add a splat: inject velocity and optionally new particles
+  function splatAt(x, y, vx, vy, radius = 30) {
+    const p = simRef.current.particles;
+    const r2 = radius * radius;
+    for (let i = 0; i < p.length; i++) {
+      const dx = p[i].x - x;
+      const dy = p[i].y - y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 > r2) continue;
+      const f = 1 - Math.sqrt(d2) / radius;
+      p[i].vx += vx * f;
+      p[i].vy += vy * f;
+    }
+
+    // small chance to add new particles near the splat
+    for (let k = 0; k < 8; k++) {
+      if (Math.random() < 0.6) continue;
+      const nx = x + (Math.random() - 0.5) * radius * 0.5;
+      const ny = y + (Math.random() - 0.5) * radius * 0.5;
+      simRef.current.particles.push({ x: nx, y: ny, vx: vx * 0.2, vy: vy * 0.2, ax: 0, ay: 0, density: 0, pressure: 0 });
+    }
+  }
+
+  // Simulation step: approximate SPH
+  function step(dt) {
+    const particles = simRef.current.particles;
+    const params = paramsRef.current;
+    const h = params.smoothingRadius;
+    const h2 = h * h;
+    const mass = 1.0;
+    const restDensity = params.restDensity;
+    const viscosityCoef = viscosity;
+    const stiffnessCoef = stiffness;
+
+    // rebuild spatial grid
+    initGrid();
+    clearGrid();
+    for (let i = 0; i < particles.length; i++) {
+      const idx = gridIndex(particles[i].x, particles[i].y);
+      if (idx >= 0) simRef.current.grid[idx].push(i);
+    }
+
+    // compute density and pressure
+    for (let i = 0; i < particles.length; i++) {
+      const pi = particles[i];
+      let density = 0;
+      const gx = Math.floor(pi.x / h);
+      const gy = Math.floor(pi.y / h);
+      for (let ox = -1; ox <= 1; ox++) {
+        for (let oy = -1; oy <= 1; oy++) {
+          const cx = gx + ox;
+          const cy = gy + oy;
+          if (cx < 0 || cy < 0 || cx >= simRef.current.cols || cy >= simRef.current.rows) continue;
+          const bucket = simRef.current.grid[cy * simRef.current.cols + cx];
+          for (let b = 0; b < bucket.length; b++) {
+            const pj = particles[bucket[b]];
+            const dx = pi.x - pj.x;
+            const dy = pi.y - pj.y;
+            const r2 = dx * dx + dy * dy;
+            if (r2 < h2) {
+              // poly6 kernel approximation
+              const t = (h2 - r2) / (h2);
+              density += mass * t * t * t;
+            }
+          }
+        }
+      }
+      pi.density = density;
+      pi.pressure = Math.max(0, stiffnessCoef * (density - restDensity));
+    }
+
+    // compute forces
+    for (let i = 0; i < particles.length; i++) {
+      const pi = particles[i];
+      let ax = 0;
+      let ay = 0;
+      const gx = Math.floor(pi.x / h);
+      const gy = Math.floor(pi.y / h);
+      for (let ox = -1; ox <= 1; ox++) {
+        for (let oy = -1; oy <= 1; oy++) {
+          const cx = gx + ox;
+          const cy = gy + oy;
+          if (cx < 0 || cy < 0 || cx >= simRef.current.cols || cy >= simRef.current.rows) continue;
+          const bucket = simRef.current.grid[cy * simRef.current.cols + cx];
+          for (let b = 0; b < bucket.length; b++) {
+            const j = bucket[b];
+            if (j === i) continue;
+            const pj = particles[j];
+            const dx = pi.x - pj.x;
+            const dy = pi.y - pj.y;
+            const r2 = dx * dx + dy * dy;
+            if (r2 < h2 && r2 > 1e-6) {
+              const r = Math.sqrt(r2);
+              // pressure force (spiky gradient)
+              const t = (h - r) / h;
+              const pressureTerm = -0.5 * (pi.pressure + pj.pressure) * t / r;
+              ax += pressureTerm * dx;
+              ay += pressureTerm * dy;
+
+              // viscosity force (Laplacian approx)
+              const dvx = pj.vx - pi.vx;
+              const dvy = pj.vy - pi.vy;
+              const visc = viscosityCoef * dvx * t;
+              ax += visc;
+              ay += viscosityCoef * dvy * t;
+            }
+          }
+        }
+      }
+
+      // external forces: gravity
+      ay += 30 * 0.5; // mild downward acceleration
+
+      pi.ax = ax / (pi.density + 1e-6);
+      pi.ay = ay / (pi.density + 1e-6);
+    }
+
+    // integrate
+    for (let i = 0; i < particles.length; i++) {
+      const p = particles[i];
+      p.vx += p.ax * dt;
+      p.vy += p.ay * dt;
+
+      // simple damping
+      p.vx *= 0.999;
+      p.vy *= 0.999;
+
+      p.x += p.vx * dt * 60; // scale so velocities feel intuitive
+      p.y += p.vy * dt * 60;
+
+      // boundary collisions
+      const r = params.particleRadius;
+      if (p.x < r) {
+        p.x = r + Math.random() * 0.5;
+        p.vx *= -0.5;
+      }
+      if (p.x > params.w - r) {
+        p.x = params.w - r - Math.random() * 0.5;
+        p.vx *= -0.5;
+      }
+      if (p.y < r) {
+        p.y = r + Math.random() * 0.5;
+        p.vy *= -0.5;
+      }
+      if (p.y > params.h - r) {
+        p.y = params.h - r - Math.random() * 0.5;
+        p.vy *= -0.5;
+      }
+    }
+
+    // trim particles if they grow too many
+    if (particles.length > Math.max(100, particleCount * 3)) {
+      particles.splice(particleCount, particles.length - particleCount);
+    }
+  }
+
+  // Rendering
+  function render(ctx) {
+    const w = paramsRef.current.w;
+    const h = paramsRef.current.h;
+    ctx.clearRect(0, 0, w, h);
+
+    // background
+    ctx.fillStyle = "#0b1220";
+    ctx.fillRect(0, 0, w, h);
+
+    // draw simple field by connecting nearby particles lightly
+    const p = simRef.current.particles;
+    ctx.globalCompositeOperation = "lighter";
+    for (let i = 0; i < p.length; i++) {
+      const pi = p[i];
+      // color mapping by speed
+      const speed = Math.sqrt(pi.vx * pi.vx + pi.vy * pi.vy);
+      const t = Math.min(1, speed / 150);
+      const r = Math.floor(180 + t * 75);
+      const g = Math.floor(200 - t * 120);
+      const b = Math.floor(255 - t * 200);
+      ctx.fillStyle = `rgba(${r}, ${g}, ${b}, 0.9)`;
+      ctx.beginPath();
+      ctx.arc(pi.x, pi.y, paramsRef.current.particleRadius, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalCompositeOperation = "source-over";
+
+    // HUD: simple stats
+    ctx.fillStyle = "rgba(255,255,255,0.8)";
+    ctx.font = "12px Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto";
+    ctx.fillText(`Particles: ${p.length}`, 10, 18);
+    ctx.fillText(`Viscosity: ${viscosity.toFixed(3)}`, 10, 36);
+    ctx.fillText(`Stiffness: ${stiffness.toFixed(2)}`, 10, 54);
+  }
+
+  // Controls handlers
+  function handlePause() {
+    setRunning((r) => !r);
+  }
+  function handleClear() {
+    initParticles(0);
+  }
+  function handleReset() {
+    initParticles(particleCount);
+  }
+
+  return (
+    <div className="p-4 h-full flex flex-col gap-4">
+      <div className="flex items-center gap-4">
+        <button
+          className="px-3 py-1 rounded-xl shadow-sm bg-slate-800 text-white"
+          onClick={handlePause}
+        >
+          {running ? "Pause" : "Run"}
+        </button>
+        <button
+          className="px-3 py-1 rounded-xl shadow-sm bg-slate-800 text-white"
+          onClick={handleReset}
+        >
+          Reset
+        </button>
+        <button
+          className="px-3 py-1 rounded-xl shadow-sm bg-slate-800 text-white"
+          onClick={() => splatAt(paramsRef.current.w / 2, paramsRef.current.h / 2, (Math.random() - 0.5) * 400, -500, 120)}
+        >
+          Big Splat
+        </button>
+        <button
+          className="px-3 py-1 rounded-xl shadow-sm bg-slate-800 text-white"
+          onClick={() => splatAt(paramsRef.current.w / 2, paramsRef.current.h / 2, 0, 400, 120)}
+        >
+          Down Splat
+        </button>
+        <div className="ml-auto text-sm text-slate-300">Tip: drag on canvas to add splats</div>
+      </div>
+
+      <div className="flex gap-4 items-center">
+        <label className="text-sm">Particles</label>
+        <input
+          type="range"
+          min={200}
+          max={8000}
+          value={particleCount}
+          onChange={(e) => setParticleCount(parseInt(e.target.value))}
+        />
+        <label className="text-sm">Viscosity</label>
+        <input
+          type="range"
+          min={0}
+          max={0.2}
+          step={0.001}
+          value={viscosity}
+          onChange={(e) => setViscosity(parseFloat(e.target.value))}
+        />
+        <label className="text-sm">Stiffness</label>
+        <input
+          type="range"
+          min={0}
+          max={2}
+          step={0.01}
+          value={stiffness}
+          onChange={(e) => setStiffness(parseFloat(e.target.value))}
+        />
+      </div>
+
+      <div className="flex-1 border rounded-lg overflow-hidden">
+        <canvas ref={canvasRef} className="w-full h-full block" />
+      </div>
+    </div>
+  );
+}
+      
